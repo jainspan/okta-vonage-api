@@ -32,35 +32,51 @@ const messagesAuth = new Auth({
 });
 const messagesClient = new Messages(messagesAuth);
 
-// ---- Inline Hook endpoint (deliver Okta's OTP via SMS) ----
-app.post('/verify', async (req, res) => {
-  try {
-    const mp = req.body?.data?.messageProfile || {};
-    const phoneE164 = String(mp.phoneNumber || '');    // e.g., +15551234567
-    const delivery   = String(mp.deliveryChannel || 'SMS');
-    const otp        = String(mp.otpCode || '');       // Okta-generated code
 
-    // Log the exact OTP Okta expects the user to enter (visibility for your tests)
+app.post('/verify', (req, res) => {
+  const started = process.hrtime.bigint();
+
+  try {
+    const mp        = req.body?.data?.messageProfile || {};
+    const phoneE164 = String(mp.phoneNumber || '');         // e.g., +15551234567
+    const delivery  = String(mp.deliveryChannel || 'SMS');  // Okta -> 'SMS' | 'VOICE'
+    const otp       = String(mp.otpCode || '');             // <-- Okta’s code
+
+    // Log exactly what Okta expects the user to enter
     console.log(`[VERIFY] ${delivery} to ${phoneE164} | otpCode: ${otp}`);
 
-    // Messages API expects E.164 WITHOUT '+' for both 'to' and 'from'
+    // Prepare SMS text and numbers for Messages API (E.164 WITHOUT '+')
     const to   = phoneE164.replace(/^\+/, '');
     const from = String(process.env.VERIFICATION_NUMBER || '').replace(/^\+/, '');
     const text = `${process.env.VERIFICATION_TEXT || 'Your verification code is:'} ${otp}`;
 
-    // Send SMS via Vonage Messages API (JWT auth)
-    await messagesClient.send(new SMS({ to, from, text }));
-
-    // Respond quickly to Okta with success (stay under ~3s timeout)
-    return res.status(200).json({
+    // ---- Return to Okta IMMEDIATELY (under a few ms) ----
+    res.status(200).json({
       commands: [{ type: 'com.okta.telephony.action', value: [{ status: 'ALLOW' }] }]
     });
+
+    const responded = Number(process.hrtime.bigint() - started) / 1e6;
+    console.log(`[VERIFY] responded to Okta in ${responded.toFixed(1)} ms`);
+
+    // ---- Fire-and-forget: send SMS after responding ----
+    // Do NOT await; just log success/failure.
+    messagesClient
+      .send(new SMS({ to, from, text }))
+      .then(() => console.log(`[VERIFY/Messages] SMS sent to ${to}`))
+      .catch(err => {
+        const msg = err?.response || err?.message || err;
+        console.error('[VERIFY/Messages] SMS send failed:', msg);
+      });
+
   } catch (e) {
-    console.error('[VERIFY/Messages] error:', e?.response || e);
-    // Okta may skip your hook on non-200; during debug this is ok—watch System Log
-    return res.status(500).json({ error: 'SMS_SEND_FAILED' });
+    // If something blows up before we respond, try to return a failure (Okta may skip the hook).
+    console.error('[VERIFY] handler error before respond:', e?.response || e);
+    try {
+      res.status(500).json({ error: 'SMS_SEND_FAILED' });
+    } catch { /* already responded */ }
   }
 });
+
 
 // ---- Start the server ----
 const PORT = process.env.PORT || 3000;
