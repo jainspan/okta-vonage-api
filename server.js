@@ -1,142 +1,67 @@
-require("dotenv").config();
+require('dotenv').config();
 
-const { Auth } = require("@vonage/auth");
-const { Messages, SMS } = require("@vonage/messages");
-const {
-  Voice,
-  NCCOBuilder,
-  Talk,
-  OutboundCallWithNCCO,
-} = require("@vonage/voice");
-
-const express = require("express");
-
+const express = require('express');
 const app = express();
+app.use(express.json());
 
-const credentials = new Auth({
+// ---- Okta Inline Hook header auth (validate every request) ----
+const AUTH_HEADER_KEY = process.env.AUTH_HEADER_KEY || 'Authorization';
+const AUTH_HEADER_VALUE = process.env.AUTH_HEADER_VALUE;
+
+// Optional health probe for external reachability
+app.get('/health', (req, res) => {
+  console.log('[HEALTH]', new Date().toISOString());
+  res.status(200).send('ok');
+});
+
+app.use((req, res, next) => {
+  const incoming = req.headers[AUTH_HEADER_KEY.toLowerCase()];
+  if (!AUTH_HEADER_VALUE || incoming !== AUTH_HEADER_VALUE) {
+    return res.status(401).send('Unauthorized'); // reject non-Okta callers
+  }
+  next();
+});
+
+// ---- Vonage Messages API (JWT auth with Application ID + private key) ----
+const { Auth } = require('@vonage/auth');
+const { Messages, SMS } = require('@vonage/messages');
+
+const messagesAuth = new Auth({
   applicationId: process.env.VONAGE_APPLICATION_ID,
   privateKey: process.env.VONAGE_PRIVATE_KEY,
 });
+const messagesClient = new Messages(messagesAuth);
 
-const brand = process.env.VERIFY_BRAND;
-
-const options = {};
-
-const smsClient = new Messages(credentials, options);
-const voiceClient = new Voice(credentials, options);
-
-app.use(express.json());
-
-app.post("/verify", async (req, res) => {
+// ---- Inline Hook endpoint (deliver Okta's OTP via SMS) ----
+app.post('/verify', async (req, res) => {
   try {
-    //console.log(req.body.data.messageProfile);
-    const number = req.body.data.messageProfile.phoneNumber.replace(/\+/g, "");
-    const code = req.body.data.messageProfile.otpCode;
-    const channel = req.body.data.messageProfile.deliveryChannel;
-    const ret = await sendVerificationRequest(number, code, channel);
-    res.send(ret);
+    const mp = req.body?.data?.messageProfile || {};
+    const phoneE164 = String(mp.phoneNumber || '');    // e.g., +15551234567
+    const delivery   = String(mp.deliveryChannel || 'SMS');
+    const otp        = String(mp.otpCode || '');       // Okta-generated code
+
+    // Log the exact OTP Okta expects the user to enter (visibility for your tests)
+    console.log(`[VERIFY] ${delivery} to ${phoneE164} | otpCode: ${otp}`);
+
+    // Messages API expects E.164 WITHOUT '+' for both 'to' and 'from'
+    const to   = phoneE164.replace(/^\+/, '');
+    const from = String(process.env.VERIFICATION_NUMBER || '').replace(/^\+/, '');
+    const text = `${process.env.VERIFICATION_TEXT || 'Your verification code is:'} ${otp}`;
+
+    // Send SMS via Vonage Messages API (JWT auth)
+    await messagesClient.send(new SMS({ to, from, text }));
+
+    // Respond quickly to Okta with success (stay under ~3s timeout)
+    return res.status(200).json({
+      commands: [{ type: 'com.okta.telephony.action', value: [{ status: 'ALLOW' }] }]
+    });
   } catch (e) {
-    console.error(e);
-    res.send(getErrorResponse("SMS", e));
+    console.error('[VERIFY/Messages] error:', e?.response || e);
+    // Okta may skip your hook on non-200; during debug this is ok—watch System Log
+    return res.status(500).json({ error: 'SMS_SEND_FAILED' });
   }
 });
 
-app.listen(process.env.PORT, () =>
-  console.log(`Running on port ${process.env.PORT}`)
-);
-
-async function sendVerificationRequest(number, code, channel) {
-  let params;
-  if (channel.toLowerCase() == "sms") {
-    console.log("Sending SMS to " + number);
-  } else {
-    console.log("Sending Call to " + number);
-    const ret = await sendCall(number, code);
-    return getSuccessResponse("verify", ret.uuid);
-  }
-
-  let res;
-  try {
-    res = await smsClient.send(
-      new SMS({
-        to: number,
-        from: process.env.VERIFICATION_NUMBER,
-        text: process.env.VERIFICATION_TEXT + code,
-      })
-    );
-
-    console.log(res);
-    return getSuccessResponse("verify", res.requestId);
-  } catch (error) {
-    console.log(res);
-    throw error;
-  }
-}
-async function sendCall(number, code) {
-  const tts = `<speak>${
-    process.env.VERIFICATION_TEXT
-  } <prosody rate='x-slow'>${code
-    .split("")
-    .join(". ")}</prosody>. Again, that's: <prosody rate='x-slow'>${code
-    .split("")
-    .join(". ")}</prosody>. Good bye!</speak>`;
-
-  const builder = new NCCOBuilder();
-  builder.addAction(new Talk(tts));
-  console.debug(`Sending tts: ${tts}`);
-
-  let resp;
-
-  try {
-    resp = await voiceClient.createOutboundCall(
-      new OutboundCallWithNCCO(
-        builder.build(),
-        { type: "phone", number: number },
-        { type: "phone", number: process.env.VERIFICATION_NUMBER }
-      )
-    );
-    console.debug(`Call uuid: ${resp.uuid}`);
-  } catch (e) {
-    console.log(e);
-  }
-
-  return resp;
-}
-function getSuccessResponse(method, sid) {
-  console.log("Successfully sent " + method + " : " + sid);
-  const actionKey = "com.okta.telephony.action";
-  const actionVal = "SUCCESSFUL";
-  const providerName = "VONAGE";
-  const resp = {
-    commands: [
-      {
-        type: actionKey,
-        value: [
-          {
-            status: actionVal,
-            provider: providerName,
-            transactionId: sid,
-          },
-        ],
-      },
-    ],
-  };
-  return resp;
-}
-
-function getErrorResponse(method, error) {
-  console.log("Error in " + method + " : " + error);
-  const errorResp = {
-    error: {
-      errorSummary: error.response.data.title,
-      errorCauses: [
-        {
-          errorSummary: error.code,
-          reason: error.response.data.detail,
-          location: error.detail,
-        },
-      ],
-    },
-  };
-  return errorResp;
-}
+// ---- Start the server ----
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Running on port ${PORT}`));
